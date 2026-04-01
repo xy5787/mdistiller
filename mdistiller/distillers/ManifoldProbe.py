@@ -186,19 +186,24 @@ class ManifoldProbe:
         
     # ── [NEW] Exhaustive k-pixel sweep (진짜 전수조사) ──
 
-    def pixel_sweep_exhaustive(self, base_image, salient_pixels_k, num_values=256, batch_size=512):
+    def pixel_sweep_exhaustive(self, base_image, salient_pixels_k,
+                                num_values=256, batch_size=1024,
+                                save_path=None):
         """
         k개 픽셀의 모든 조합을 전수조사.
-        num_values^k 개의 이미지를 생성하고 teacher output을 기록.
+        메모리 절약: 이미지 전체 대신 (combo_index, soft_label)만 저장.
+        base_image + salient_pixels_k + combo_index로 이미지를 복원 가능.
 
         Args:
             base_image: [1, 1, 28, 28] seed image
             salient_pixels_k: list of (r, c), length = k
-            num_values: per-pixel resolution (256 = full 8-bit, 32 = coarse)
-            batch_size: GPU batch size for teacher inference
+            num_values: per-pixel resolution
+            batch_size: GPU batch size
+            save_path: if given, append results to this file incrementally
 
         Returns:
-            dict with images, soft_labels, hard_labels
+            dict with soft_labels, hard_labels, combo_values
+            (images는 저장하지 않음 — 필요시 reconstruct)
         """
         import itertools
 
@@ -209,12 +214,11 @@ class ManifoldProbe:
         print(f"    Exhaustive sweep: k={k}, {num_values} values/pixel, "
               f"total={total:,} combinations")
 
-        # Pre-generate all value combinations as a tensor
-        # Each row is one combination of k values
+        # Pre-generate all value combinations
         grids = torch.meshgrid(*[values for _ in range(k)], indexing='ij')
         combos = torch.stack([g.flatten() for g in grids], dim=1)  # [total, k]
 
-        all_images = []
+        all_combo_vals = []
         all_soft = []
         all_hard = []
 
@@ -227,8 +231,8 @@ class ManifoldProbe:
                 batch_combos = combos[start:end]  # [B, k]
                 B = len(batch_combos)
 
-                # Create batch of images
-                imgs = base_image.expand(B, -1, -1, -1).clone()  # [B, 1, 28, 28]
+                # Create batch of images (temporary, not stored)
+                imgs = base_image.expand(B, -1, -1, -1).clone()
                 for p_idx, (r, c) in enumerate(salient_pixels_k):
                     imgs[:, 0, r, c] = batch_combos[:, p_idx]
 
@@ -236,15 +240,27 @@ class ManifoldProbe:
                 logits, _ = self.teacher(imgs.to(self.device))
                 probs = F.softmax(logits, dim=1)
 
-                all_images.append(imgs.cpu())
+                all_combo_vals.append(batch_combos)
                 all_soft.append(probs.cpu())
                 all_hard.append(probs.argmax(dim=1).cpu())
 
-        return {
-            "images": torch.cat(all_images, dim=0),
-            "soft_labels": torch.cat(all_soft, dim=0),
-            "hard_labels": torch.cat(all_hard, dim=0),
+                # imgs는 저장하지 않음 — 즉시 GC 대상
+
+        result = {
+            "combo_values": torch.cat(all_combo_vals, dim=0),  # [N, k] — 아주 작음
+            "soft_labels": torch.cat(all_soft, dim=0),          # [N, 10]
+            "hard_labels": torch.cat(all_hard, dim=0),          # [N]
         }
+
+        # 증분 저장
+        if save_path is not None:
+            torch.save(result, save_path)
+            # 메모리 해제
+            del result, all_combo_vals, all_soft, all_hard
+            torch.cuda.empty_cache()
+            return None
+
+        return result
     
     
 

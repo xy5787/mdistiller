@@ -1,24 +1,25 @@
 """
-Step 3 (v3): True exhaustive k-pixel sweep.
+Step 3 (v3): True exhaustive k-pixel sweep — memory-safe version.
 
-k=3, 256 values: 256^3 = 16,777,216 combinations per class per seed
-k=4, 32 values:   32^4 =  1,048,576 combinations per class per seed
+Results saved per-class to avoid OOM.
+Images NOT stored — reconstructed on-the-fly during training.
 
 Usage:
     cd mdistiller
 
-    # Experiment 1: k=3, full 256 resolution (~20min)
+    # k=3, 256 values (~20min GPU)
     python tools/probe_sweep/step3_pixel_sweep.py \
-        --k 3 --num_values 256 --save_path outputs/sweep_k3_v256.pt
+        --k 3 --num_values 256 --save_dir outputs/sweep_k3_v256
 
-    # Experiment 2: k=4, coarse 32 resolution (~1min)
+    # k=4, 32 values (~1min GPU)
     python tools/probe_sweep/step3_pixel_sweep.py \
-        --k 4 --num_values 32 --save_path outputs/sweep_k4_v32.pt
+        --k 4 --num_values 32 --save_dir outputs/sweep_k4_v32
 """
 import os
 import sys
 import argparse
 import torch
+import gc
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, ROOT)
@@ -29,7 +30,6 @@ from mdistiller.distillers.ManifoldProbe import ManifoldProbe, entropy_filter
 
 
 def get_mean_image(dataloader, target_class):
-    """Get mean image of a class as seed."""
     class_sum = torch.zeros(1, 1, 28, 28)
     count = 0
     for images, labels in dataloader:
@@ -44,15 +44,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--teacher_ckpt", type=str, default="checkpoints/teacher_mnist.pth")
     parser.add_argument("--saliency_path", type=str, default="outputs/saliency/all_classes.pt")
-    parser.add_argument("--k", type=int, default=3,
-                        help="Number of pixels to exhaustively sweep")
-    parser.add_argument("--num_values", type=int, default=256,
-                        help="Values per pixel (total combos = num_values^k)")
-    parser.add_argument("--batch_size", type=int, default=1024,
-                        help="Batch size for teacher inference")
+    parser.add_argument("--k", type=int, default=3)
+    parser.add_argument("--num_values", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--entropy_low", type=float, default=5)
     parser.add_argument("--entropy_high", type=float, default=95)
-    parser.add_argument("--save_path", type=str, default="outputs/sweep_exhaustive.pt")
+    parser.add_argument("--save_dir", type=str, default="outputs/sweep_exhaustive")
     parser.add_argument("--data_root", type=str, default="./data")
     args = parser.parse_args()
 
@@ -63,6 +60,7 @@ def main():
     print(f"  Exhaustive Sweep: k={args.k}, {args.num_values} values/pixel")
     print(f"  Combinations per class: {total_per_class:,}")
     print(f"  Total (10 classes): {total_per_class * 10:,}")
+    print(f"  Memory mode: combo_values only (no image storage)")
     print(f"{'='*60}")
 
     # Load teacher
@@ -77,70 +75,71 @@ def main():
     sal_data = torch.load(args.saliency_path, weights_only=False)
     all_pixels = sal_data["pixels"]
 
-    # Dataloader for mean images
+    # Dataloader
     train_loader, _, _ = get_mnist_dataloaders(batch_size=256, data_root=args.data_root)
 
-    # ── Per-class exhaustive sweep ──
-    all_images = []
-    all_soft = []
-    all_hard = []
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # Save metadata for reconstruction later
+    meta = {
+        "k": args.k,
+        "num_values": args.num_values,
+        "pixels": {},       # class -> [(r,c),...]
+        "base_images": {},  # class -> [1,1,28,28]
+    }
+
+    total_kept = 0
 
     for c in range(10):
-        pixels_k = all_pixels[c][:args.k]  # top-k most salient
+        pixels_k = all_pixels[c][:args.k]
         seed = get_mean_image(train_loader, target_class=c)
 
+        meta["pixels"][c] = pixels_k
+        meta["base_images"][c] = seed
+
         print(f"\nClass {c}: pixels={pixels_k}")
-        result = probe.pixel_sweep_exhaustive(
+
+        # Sweep — 결과가 save_path에 저장됨
+        class_save = os.path.join(args.save_dir, f"class_{c}_raw.pt")
+        probe.pixel_sweep_exhaustive(
             base_image=seed,
             salient_pixels_k=pixels_k,
             num_values=args.num_values,
             batch_size=args.batch_size,
+            save_path=class_save,
         )
 
-        all_images.append(result["images"])
-        all_soft.append(result["soft_labels"])
-        all_hard.append(result["hard_labels"])
+        # Load back for entropy filtering (combo_values + soft_labels만이라 작음)
+        raw = torch.load(class_save, weights_only=False)
+        print(f"    Raw: {len(raw['hard_labels']):,} samples")
 
-        # Per-class stats
-        dist = torch.bincount(result["hard_labels"], minlength=10)
-        print(f"    Hard label dist: {dist.tolist()}")
+        filtered, stats = entropy_filter(
+            raw,
+            low_percentile=args.entropy_low,
+            high_percentile=args.entropy_high,
+        )
+        print(f"    Filtered: {stats['filtered_size']:,} / {stats['original_size']:,}")
 
-    # Merge
-    raw_dataset = {
-        "images": torch.cat(all_images, dim=0),
-        "soft_labels": torch.cat(all_soft, dim=0),
-        "hard_labels": torch.cat(all_hard, dim=0),
-    }
+        # Save filtered version
+        torch.save(filtered, os.path.join(args.save_dir, f"class_{c}.pt"))
+        total_kept += stats['filtered_size']
+
+        # Remove raw file to save disk
+        os.remove(class_save)
+
+        # Force garbage collection
+        del raw, filtered
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Save metadata
+    torch.save(meta, os.path.join(args.save_dir, "meta.pt"))
+
     print(f"\n{'='*60}")
-    print(f"Raw dataset: {len(raw_dataset['images']):,} samples")
-
-    # ── Entropy filtering ──
-    filtered, stats = entropy_filter(
-        raw_dataset,
-        low_percentile=args.entropy_low,
-        high_percentile=args.entropy_high,
-    )
-
-    print(f"\nEntropy filtering:")
-    print(f"  Range: [{stats['entropy_low_thresh']:.4f}, {stats['entropy_high_thresh']:.4f}]")
-    print(f"  Mean: {stats['entropy_mean']:.4f} (std: {stats['entropy_std']:.4f})")
-    print(f"  Kept: {stats['filtered_size']:,} / {stats['original_size']:,}")
-
-    # Save
-    filtered["metadata"] = {
-        "k": args.k,
-        "num_values": args.num_values,
-        "total_raw": stats["original_size"],
-        "total_filtered": stats["filtered_size"],
-        "entropy_stats": stats,
-    }
-
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-    torch.save(filtered, args.save_path)
-
-    print(f"\nSaved: {args.save_path}")
-    print(f"  Shape: {filtered['images'].shape}")
-    print(f"  File size: {os.path.getsize(args.save_path) / 1e6:.1f} MB")
+    print(f"Done! Total filtered samples: {total_kept:,}")
+    print(f"Saved to: {args.save_dir}/")
+    print(f"  class_0.pt ~ class_9.pt  (per-class sweep data)")
+    print(f"  meta.pt                   (base_images + pixel positions)")
 
 
 if __name__ == "__main__":

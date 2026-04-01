@@ -1,15 +1,11 @@
 """
-Step 4: Distill Student using the synthetic sweep dataset.
+Step 4 (v3): Distill Student using exhaustive sweep data.
 
-This is the actual KD step — student learns from teacher's soft labels
-on the synthetically generated data. No real MNIST images used here.
-
-Output: checkpoints/student_manifold.pth
+Loads per-class files and reconstructs images on-the-fly.
 
 Usage:
     cd mdistiller
-    python tools/probe_sweep/step4_distill.py
-    python tools/probe_sweep/step4_distill.py --temperature 4.0 --epochs 30
+    python tools/probe_sweep/step4_distill.py --sweep_dir outputs/sweep_k3_v256
 """
 import os
 import sys
@@ -22,13 +18,12 @@ sys.path.insert(0, ROOT)
 
 from mdistiller.models.mnist import StudentCNN
 from mdistiller.dataset.mnist import get_mnist_dataloaders
-from mdistiller.dataset.synthetic import get_synthetic_dataloader
+from mdistiller.dataset.synthetic import get_exhaustive_dataloader
 from mdistiller.distillers.ManifoldProbe import ManifoldProbeKD
 
 
 @torch.no_grad()
 def evaluate_on_real(model, val_loader, device):
-    """Evaluate student on REAL MNIST test set (the true test)."""
     model.eval()
     correct, total = 0, 0
     for images, labels in val_loader:
@@ -63,10 +58,11 @@ def train_one_epoch(distiller, loader, optimizer, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sweep_path", type=str, default="outputs/sweep_dataset_v2.pt")
+    parser.add_argument("--sweep_dir", type=str, default="outputs/sweep_exhaustive",
+                        help="Directory with class_0.pt~class_9.pt + meta.pt")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=4.0)
     parser.add_argument("--ce_weight", type=float, default=0.1)
     parser.add_argument("--kd_weight", type=float, default=0.9)
@@ -77,16 +73,21 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Synthetic dataloader (for training)
-    syn_loader, num_syn = get_synthetic_dataloader(
-        args.sweep_path, batch_size=args.batch_size
-    )
-    print(f"Synthetic dataset: {num_syn:,} samples")
+    # Load metadata (base images + pixel positions)
+    meta = torch.load(os.path.join(args.sweep_dir, "meta.pt"), weights_only=False)
 
-    # Real MNIST val loader (for evaluation only — not used in training!)
-    _, val_loader, _ = get_mnist_dataloaders(
-        batch_size=256, data_root=args.data_root
+    # Build dataloader (images reconstructed on-the-fly)
+    print(f"\nLoading sweep data from {args.sweep_dir}/")
+    syn_loader, num_syn = get_exhaustive_dataloader(
+        class_dir=args.sweep_dir,
+        base_images=meta["base_images"],
+        all_pixels_k=meta["pixels"],
+        batch_size=args.batch_size,
     )
+    print(f"Total synthetic samples: {num_syn:,}")
+
+    # Real MNIST val loader (evaluation only)
+    _, val_loader, _ = get_mnist_dataloaders(batch_size=256, data_root=args.data_root)
 
     # Student + Distiller
     student = StudentCNN(num_classes=10).to(device)
@@ -119,7 +120,6 @@ def main():
                 "model": student.state_dict(),
                 "epoch": epoch,
                 "real_acc": real_acc,
-                "syn_acc": syn_acc,
             }, save_path)
 
     print(f"\nBest real MNIST accuracy: {best_real_acc:.4f}")
