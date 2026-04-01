@@ -272,22 +272,9 @@ class ManifoldProbe:
 def entropy_filter(dataset, low_percentile=5, high_percentile=95):
     """
     Remove off-manifold samples based on teacher output entropy.
-
-    - Too low entropy (overconfident) → likely trivial/off-manifold
-    - Too high entropy (near uniform) → teacher is confused, off-manifold
-
-    Keep samples in the middle range.
-
-    Args:
-        dataset: dict with images, soft_labels, hard_labels
-        low_percentile: remove below this percentile of entropy
-        high_percentile: remove above this percentile
-
-    Returns:
-        filtered dataset dict + stats
+    Works with both v1 (images) and v3 (combo_values) format.
     """
     probs = dataset["soft_labels"]  # [N, 10]
-    # H(p) = -sum(p * log(p))
     log_probs = torch.log(probs + 1e-10)
     entropy = -(probs * log_probs).sum(dim=1)  # [N]
 
@@ -296,11 +283,13 @@ def entropy_filter(dataset, low_percentile=5, high_percentile=95):
 
     mask = (entropy >= low_thresh) & (entropy <= high_thresh)
 
-    filtered = {
-        "images": dataset["images"][mask],
-        "soft_labels": dataset["soft_labels"][mask],
-        "hard_labels": dataset["hard_labels"][mask],
-    }
+    # Filter all tensor fields present in dataset
+    filtered = {}
+    for key, val in dataset.items():
+        if isinstance(val, torch.Tensor):
+            filtered[key] = val[mask]
+        else:
+            filtered[key] = val  # keep non-tensor fields as-is
 
     stats = {
         "original_size": len(entropy),
